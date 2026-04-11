@@ -63,4 +63,20 @@ public abstract class DocIdStream {
    * {@code false} when the stream is exhausted.
    */
   public abstract boolean mayHaveRemaining();
+
+  /**
+   * Copy some matching doc IDs into the provided array and return the number of copied elements. A
+   * return value of {@code 0} indicates that there are no more matching doc IDs. The given array
+   * must not be empty.
+   */
+  public int intoArray(int[] array) {
+    return intoArray(DocIdSetIterator.NO_MORE_DOCS, array);
+  }
+
+  /**
+   * Copy some matching doc IDs under {@code upTo} (exclusive) into the provided array and return
+   * the number of copied elements. A return value of {@code 0} indicates that there are no matching
+   * doc IDs under {@code upTo} anymore. The given array must not be empty.
+   */
+  public abstract int intoArray(int upTo, int[] array);
 }

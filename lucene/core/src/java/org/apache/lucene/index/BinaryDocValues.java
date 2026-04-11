@@ -33,4 +33,19 @@ public abstract class BinaryDocValues extends DocValuesIterator {
    * @return binary value
    */
   public abstract BytesRef binaryValue() throws IOException;
+
+  /**
+   * Async prefetch hint for a batch of doc IDs. Issues prefetch calls for the byte ranges
+   * that subsequent {@code advanceExact()} + {@code binaryValue()} calls on the same docs
+   * would read. This is a hint — it warms cache but does not affect correctness.
+   *
+   * <p>For fixed-length binary fields, this prefetches the data slice at the computed offsets.
+   * For variable-length binary fields, this prefetches both the address index and the data.
+   *
+   * @param docs sorted ascending array of doc IDs (no duplicates)
+   * @param size number of valid entries in the docs array
+   */
+  public void prefetchBinaryValues(int[] docs, int size) throws IOException {
+    // default no-op — codec implementations override with async prefetch
+  }
 }

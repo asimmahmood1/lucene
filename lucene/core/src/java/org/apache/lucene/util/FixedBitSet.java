@@ -870,4 +870,76 @@ public final class FixedBitSet extends BitSet {
       bits ^= 1L << ntz;
     }
   }
+
+  /**
+   * Copy set bits in the range {@code [from, to)} into the given array, adding {@code base} to
+   * each value. Return the number of values that have been written to the array.
+   */
+  public int intoArray(int from, int to, int base, int[] array) {
+    Objects.checkFromToIndex(from, to, length());
+
+    int offset = 0;
+    if ((from & 0x3F) != 0) {
+      long word = bits[from >> 6] >>> from;
+      int numBitsTilNextWord = -from & 0x3F;
+      if (to - from < numBitsTilNextWord) {
+        word &= (1L << (to - from)) - 1L;
+        return word2Array(word, from + base, array, offset);
+      }
+      offset = word2Array(word, from + base, array, offset);
+      from += numBitsTilNextWord;
+      assert (from & 0x3F) == 0;
+    }
+
+    for (int i = from >> 6, end = to >> 6; i < end; ++i) {
+      long word = bits[i];
+      offset = word2Array(word, base + (i << 6), array, offset);
+    }
+
+    if ((to & 0x3F) != 0) {
+      long word = bits[to >> 6] & ((1L << to) - 1);
+      offset = word2Array(word, base + (to & ~0x3F), array, offset);
+    }
+
+    return offset;
+  }
+
+  private static int word2Array(long word, int base, int[] docs, int offset) {
+    final int bitCount = Long.bitCount(word);
+
+    if (bitCount >= 32 && docs.length - offset > bitCount) {
+      return denseWord2Array(word, base, docs, offset);
+    }
+
+    int numBitsToCopy = Math.min(bitCount, docs.length - offset);
+
+    for (int i = 0; i < numBitsToCopy; i++) {
+      int ntz = Long.numberOfTrailingZeros(word);
+      docs[offset + i] = base + ntz;
+      word ^= 1L << ntz;
+    }
+
+    return offset + numBitsToCopy;
+  }
+
+  private static int denseWord2Array(long word, int base, int[] docs, int offset) {
+    assert docs.length - offset >= Long.bitCount(word) + 1;
+
+    final int lWord = (int) word;
+    final int hWord = (int) (word >>> 32);
+    final int offset32 = offset + Integer.bitCount(lWord);
+    int hOffset = offset32;
+
+    for (int i = 0; i < 32; i++) {
+      docs[offset] = base + i;
+      docs[hOffset] = base + i + 32;
+      offset += (lWord >>> i) & 1;
+      hOffset += (hWord >>> i) & 1;
+    }
+
+    docs[offset32] = base + 32 + Integer.numberOfTrailingZeros(hWord);
+
+    return hOffset;
+  }
+
 }

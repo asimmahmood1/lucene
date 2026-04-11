@@ -35,4 +35,57 @@ public abstract class SortedNumericDocValues extends DocValuesIterator {
    * It is illegal to call this method after {@link #advanceExact(int)} returned {@code false}.
    */
   public abstract int docValueCount();
+
+  /**
+   * Prefetch the data needed to iterate values for a batch of documents. This prepares
+   * the underlying storage (DISI existence bitmap, address index, and value data) so that
+   * subsequent {@link #advanceExact(int)}, {@link #docValueCount()}, and {@link #nextValue()}
+   * calls find the data already in cache rather than blocking on synchronous IO.
+   *
+   * <p>The default implementation is a no-op. Codec implementations override this to
+   * prefetch three layers of data:
+   * <ol>
+   *   <li>DISI blocks (sparse fields only) — which docs have values</li>
+   *   <li>Address index blocks — maps each doc to its value range in the flat values array</li>
+   *   <li>Value data blocks — the actual packed integer values</li>
+   * </ol>
+   *
+   * <p><b>IMPORTANT:</b> The docs array must be sorted ascending with no duplicates.
+   * Call this once for a batch, then iterate the batch normally. The prefetch is
+   * non-speculative — every prefetched block will be read by the subsequent iteration.
+   *
+   * <p><b>Recommended usage — date_histogram aggregation:</b>
+   * <pre>{@code
+   * // Batch of doc IDs from the collector
+   * sndv.prefetchRange(docs, batchSize);
+   * // Iterate normally — DISI, addresses, and values are all warm
+   * for (int i = 0; i < batchSize; i++) {
+   *     if (sndv.advanceExact(docs[i])) {
+   *         int count = sndv.docValueCount();
+   *         for (int j = 0; j < count; j++) {
+   *             long value = sndv.nextValue();
+   *             histogram.collect(value);
+   *         }
+   *     }
+   * }
+   * }</pre>
+   *
+   * <p><b>Recommended usage — composite aggregation:</b>
+   * <pre>{@code
+   * sndv.prefetchRange(docs, batchSize);
+   * for (int i = 0; i < batchSize; i++) {
+   *     if (sndv.advanceExact(docs[i])) {
+   *         for (int j = 0; j < sndv.docValueCount(); j++) {
+   *             queue.addIfCompetitive(sndv.nextValue());
+   *         }
+   *     }
+   * }
+   * }</pre>
+   *
+   * @param docs sorted array of doc IDs to prefetch data for
+   * @param size number of valid entries in the docs array
+   */
+  public void prefetchRange(int[] docs, int size) throws IOException {
+    // default no-op — codec implementations override with prefetch
+  }
 }

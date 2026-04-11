@@ -103,6 +103,21 @@ public abstract class SortedSetDocValues extends DocValuesIterator {
   }
 
   /**
+   * Async prefetch hint for a batch of doc IDs. Issues prefetch calls for the byte ranges
+   * that subsequent {@code advanceExact()} + {@code nextOrd()} calls on the same docs would read.
+   * This is a hint — it warms cache but does not affect correctness.
+   *
+   * <p>For multi-valued fields, this prefetches the ordinal address index and ordinal data
+   * for the given docs, so that iteration over each doc's ordinals hits warm cache.
+   *
+   * @param docs sorted ascending array of doc IDs (no duplicates)
+   * @param size number of valid entries in the docs array
+   */
+  public void prefetchOrds(int[] docs, int size) throws IOException {
+    // default no-op — codec implementations override with async prefetch
+  }
+
+  /**
    * Returns a {@link TermsEnum} over the values, filtered by a {@link CompiledAutomaton} The enum
    * supports {@link TermsEnum#ord()}.
    */
