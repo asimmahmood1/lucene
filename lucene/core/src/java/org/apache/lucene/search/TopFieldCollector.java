@@ -21,10 +21,13 @@ import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
+import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.NumericDocValues;
 import org.apache.lucene.index.ReaderUtil;
 import org.apache.lucene.search.FieldValueHitQueue.Entry;
 import org.apache.lucene.search.TotalHits.Relation;
+import org.apache.lucene.search.comparators.NumericComparator;
 
 /**
  * A {@link Collector} that sorts by {@link SortField} using {@link FieldComparator}s.
@@ -48,6 +51,22 @@ public abstract class TopFieldCollector extends TopDocsCollector<Entry> {
     Scorable scorer;
     boolean collectedAllCompetitiveHits = false;
 
+    // Bulk collection state — null when bulk path is not available
+    final BulkValueComparator bulkValueComparator;
+    final NumericDocValues bulkDocValues;
+    final SortedDocValues bulkSortedDocValues;  // non-null for keyword sort
+    final long bulkMissingValue;
+    final int bulkMissingOrd;  // missing ordinal for keyword sort (-1 or Integer.MAX_VALUE)
+    int[] docBuffer;    // lazily allocated int[PrefetchConfig.getBatchSize()]
+    long[] valueBuffer; // lazily allocated long[PrefetchConfig.getBatchSize()]
+    int[] ordBuffer;    // lazily allocated int[PrefetchConfig.getBatchSize()] for keyword sort
+
+    // Multi-field sort state — null for single-field sorts
+    final boolean isMultiSort;
+    final LeafFieldComparator[] allComparators;  // null for single sort
+    final int[] allReverseMul;                   // null for single sort
+    final int firstReverseMul;                   // reverseMul for primary comparator
+
     TopFieldLeafCollector(FieldValueHitQueue<Entry> queue, Sort sort, LeafReaderContext context)
         throws IOException {
       // as all segments are sorted in the same way, enough to check only the 1st segment for
@@ -68,9 +87,69 @@ public abstract class TopFieldCollector extends TopDocsCollector<Entry> {
         this.reverseMul = 1;
         this.comparator = new MultiLeafFieldComparator(comparators, reverseMuls);
       }
+
+      // Detect BulkValueComparator support for bulk collect(DocIdStream) path.
+      // Defaults to null (disabled). Only enabled for numeric sorts without scoring.
+      int detectedFirstRevMul = this.reverseMul;
+      BulkValueComparator detectedBvc = null;
+      NumericDocValues detectedDv = null;
+      long detectedMv = 0;
+      boolean detectedMulti = false;
+      LeafFieldComparator[] detectedComps = null;
+      int[] detectedRevMul = null;
+
+      SortedDocValues detectedSdv = null;
+      int detectedMissingOrd = -1;
+
+      if (!needsScores && !canSetMinScore && PrefetchConfig.isEnabled()) {
+        // Try single-field numeric sort
+        if (this.comparator instanceof BulkValueComparator bvc
+                && this.comparator instanceof NumericComparator<?>.NumericLeafComparator nlc) {
+          detectedBvc = bvc;
+          detectedDv = nlc.getDocValues();
+          Object mv = sort.getSort()[0].getMissingValue();
+          detectedMv = mv instanceof Number n ? n.longValue() : 0L;
+        }
+        // Try multi-field sort (primary field must support bulk)
+        else if (this.comparator instanceof MultiLeafFieldComparator mlfc) {
+          LeafFieldComparator first = mlfc.getFirstComparator();
+          if (first instanceof BulkValueComparator bvc
+                  && first instanceof NumericComparator<?>.NumericLeafComparator nlc) {
+            detectedBvc = bvc;
+            detectedDv = nlc.getDocValues();
+            Object mv = sort.getSort()[0].getMissingValue();
+            detectedMv = mv instanceof Number n ? n.longValue() : 0L;
+            detectedMulti = true;
+            detectedComps = mlfc.getComparators();
+            detectedRevMul = mlfc.getReverseMul();
+            detectedFirstRevMul = mlfc.getFirstReverseMul();
+          }
+        }
+      }
+      this.bulkValueComparator = detectedBvc;
+      this.bulkDocValues = detectedDv;
+      this.bulkSortedDocValues = detectedSdv;
+      this.bulkMissingValue = detectedMv;
+      this.bulkMissingOrd = detectedMissingOrd;
+      this.isMultiSort = detectedMulti;
+      this.allComparators = detectedComps;
+      this.allReverseMul = detectedRevMul;
+      this.firstReverseMul = detectedFirstRevMul;
     }
 
-    void countHit(int doc) throws IOException {
+    /** Fetch values for the current batch of docs. Uses NumericDocValues or SortedDocValues. */
+    void fetchBulkValues(int count) throws IOException {
+      if (bulkSortedDocValues != null) {
+        bulkSortedDocValues.ordValues(count, docBuffer, ordBuffer, -1);
+        for (int i = 0; i < count; i++) {
+          valueBuffer[i] = ordBuffer[i];
+        }
+      } else {
+        bulkDocValues.longValues(count, docBuffer, valueBuffer, bulkMissingValue);
+      }
+    }
+
+    void countHit() throws IOException {
       int hitCountSoFar = ++totalHits;
 
       if (minScoreAcc != null && (hitCountSoFar & minScoreAcc.modInterval) == 0) {
@@ -121,6 +200,68 @@ public abstract class TopFieldCollector extends TopDocsCollector<Entry> {
       // Copy hit into queue
       comparator.copy(slot, doc);
       add(slot, doc);
+      if (queueFull) {
+        comparator.setBottom(bottom.slot);
+        updateMinCompetitiveScore(scorer);
+      }
+    }
+
+    /** Threshold check using pre-fetched values. Returns true if doc is not competitive. */
+    boolean bulkThresholdCheck(int idx) throws IOException {
+      int cmp;
+      if (isMultiSort) {
+        cmp = firstReverseMul * bulkValueComparator.compareBottomAt(idx);
+        if (cmp == 0) {
+          // Primary tied — fall back to secondary comparators per-doc
+          for (int j = 1; j < allComparators.length; j++) {
+            cmp = allReverseMul[j] * allComparators[j].compareBottom(docBuffer[idx]);
+            if (cmp != 0) break;
+          }
+        }
+      } else {
+        cmp = reverseMul * bulkValueComparator.compareBottomAt(idx);
+      }
+
+      if (collectedAllCompetitiveHits || cmp <= 0) {
+        // Same early termination / min score logic as thresholdCheck(int doc)
+        if (searchSortPartOfIndexSort) {
+          if (totalHits > totalHitsThreshold) {
+            totalHitsRelation = Relation.GREATER_THAN_OR_EQUAL_TO;
+            throw new CollectionTerminatedException();
+          } else {
+            collectedAllCompetitiveHits = true;
+          }
+        } else if (totalHitsRelation == TotalHits.Relation.EQUAL_TO) {
+          updateMinCompetitiveScore(scorer);
+        }
+        return true;
+      }
+      return false;
+    }
+
+    /** Copy competitive hit using pre-fetched values. */
+    void bulkCollectCompetitiveHit(int idx) throws IOException {
+      bulkValueComparator.copyAt(bottom.slot, idx);
+      if (isMultiSort) {
+        for (int j = 1; j < allComparators.length; j++) {
+          allComparators[j].copy(bottom.slot, docBuffer[idx]);
+        }
+      }
+      updateBottom(docBuffer[idx]);
+      comparator.setBottom(bottom.slot);
+      updateMinCompetitiveScore(scorer);
+    }
+
+    /** Copy any hit (queue not full) using pre-fetched values. */
+    void bulkCollectAnyHit(int idx, int hitsCollected) throws IOException {
+      int slot = hitsCollected - 1;
+      bulkValueComparator.copyAt(slot, idx);
+      if (isMultiSort) {
+        for (int j = 1; j < allComparators.length; j++) {
+          allComparators[j].copy(slot, docBuffer[idx]);
+        }
+      }
+      add(slot, docBuffer[idx]);
       if (queueFull) {
         comparator.setBottom(bottom.slot);
         updateMinCompetitiveScore(scorer);
@@ -197,7 +338,7 @@ public abstract class TopFieldCollector extends TopDocsCollector<Entry> {
 
             @Override
             public void collect(int doc) throws IOException {
-              countHit(doc);
+              countHit();
               if (queueFull) {
                 if (thresholdCheck(doc)) {
                   return;
@@ -205,6 +346,99 @@ public abstract class TopFieldCollector extends TopDocsCollector<Entry> {
                 collectCompetitiveHit(doc);
               } else {
                 collectAnyHit(doc, totalHits);
+              }
+            }
+
+            // TODO: This path has no one-batch-ahead prefetch lead time — prefetch and
+            // read happen in the same batch (fetchBulkValues does inline prefetch+read).
+            // The fix: the scorer (DefaultBulkScorer, BooleanScorer) should orchestrate a
+            // window-rotation pipeline: prefetch(W1) before collect(W0), giving W0's async
+            // IO a full window of lead time. The collector would expose a separate
+            // prefetch(DocIdStream) method for async IO, and collect(DocIdStream) would
+            // read from warm cache.
+            // See prefetch-backlog.md "Scorer-side prefetch pipeline" for the full design.
+            @Override
+            public void collect(DocIdStream stream) throws IOException {
+              if (bulkValueComparator == null) {
+                super.collect(stream); // default per-doc fallback
+                return;
+              }
+              if (docBuffer == null) {
+                int batchSize = PrefetchConfig.getBatchSize();
+                docBuffer = new int[batchSize];
+                valueBuffer = new long[batchSize];
+                if (bulkSortedDocValues != null) {
+                  ordBuffer = new int[batchSize];
+                }
+              }
+              for (int count = stream.intoArray(docBuffer);
+                   count != 0;
+                   count = stream.intoArray(docBuffer)) {
+                fetchBulkValues(count);
+                bulkValueComparator.setBatch(valueBuffer, docBuffer, count);
+                for (int i = 0; i < count; i++) {
+                  countHit();
+                  if (queueFull) {
+                    if (bulkThresholdCheck(i)) {
+                      continue;
+                    }
+                    bulkCollectCompetitiveHit(i);
+                  } else {
+                    bulkCollectAnyHit(i, totalHits);
+                  }
+                }
+              }
+            }
+
+            @Override
+            public void collectRange(int min, int max) throws IOException {
+              if (bulkValueComparator == null || bulkDocValues == null
+                  ) {
+                super.collectRange(min, max);
+                return;
+              }
+              int batchSize = PrefetchConfig.getBatchSize();
+              if (valueBuffer == null) {
+                docBuffer = new int[batchSize];
+                valueBuffer = new long[batchSize];
+              }
+
+              int pos = min;
+              // Prefetch first batch before entering loop
+              int firstSize = Math.min(batchSize, max - pos);
+              bulkDocValues.prefetchRange(pos, firstSize);
+
+              while (pos < max) {
+                int batchEnd = Math.min(pos + batchSize, max);
+                int size = batchEnd - pos;
+
+                // Prefetch NEXT batch (one-ahead pipeline)
+                int nextPos = batchEnd;
+                if (nextPos < max) {
+                  int nextSize = Math.min(batchSize, max - nextPos);
+                  bulkDocValues.prefetchRange(nextPos, nextSize);
+                }
+
+                // Collect CURRENT batch — warm from prior prefetch
+                bulkDocValues.longValuesRange(pos, size, valueBuffer, bulkMissingValue);
+                // Fill docBuffer for setBatch (needed by copyAt for doc ID tracking)
+                for (int i = 0; i < size; i++) {
+                  docBuffer[i] = pos + i;
+                }
+                bulkValueComparator.setBatch(valueBuffer, docBuffer, size);
+                for (int i = 0; i < size; i++) {
+                  countHit();
+                  if (queueFull) {
+                    if (bulkThresholdCheck(i)) {
+                      continue;
+                    }
+                    bulkCollectCompetitiveHit(i);
+                  } else {
+                    bulkCollectAnyHit(i, totalHits);
+                  }
+                }
+
+                pos = batchEnd;
               }
             }
           };
@@ -241,7 +475,7 @@ public abstract class TopFieldCollector extends TopDocsCollector<Entry> {
       this.queue = queue;
       this.after = after;
 
-      FieldComparator<?>[] comparators = queue.comparators;
+      FieldComparator<?>[] comparators = queue.getComparators();
       // Tell all comparators their top value:
       for (int i = 0; i < comparators.length; i++) {
         @SuppressWarnings("unchecked")
@@ -262,7 +496,7 @@ public abstract class TopFieldCollector extends TopDocsCollector<Entry> {
 
             @Override
             public void collect(int doc) throws IOException {
-              countHit(doc);
+              countHit();
               if (queueFull) {
                 if (thresholdCheck(doc)) {
                   return;
@@ -283,6 +517,133 @@ public abstract class TopFieldCollector extends TopDocsCollector<Entry> {
               } else {
                 collectedHits++;
                 collectAnyHit(doc, collectedHits);
+              }
+            }
+
+            // TODO: Same as SimpleFieldCollector — no one-batch-ahead prefetch lead time.
+            // Scorer-side pipeline needed for the collect(DocIdStream) path.
+            @Override
+            public void collect(DocIdStream stream) throws IOException {
+              if (bulkValueComparator == null) {
+                super.collect(stream); // default per-doc fallback
+                return;
+              }
+              if (docBuffer == null) {
+                int batchSize = PrefetchConfig.getBatchSize();
+                docBuffer = new int[batchSize];
+                valueBuffer = new long[batchSize];
+                if (bulkSortedDocValues != null) {
+                  ordBuffer = new int[batchSize];
+                }
+              }
+              for (int count = stream.intoArray(docBuffer);
+                   count != 0;
+                   count = stream.intoArray(docBuffer)) {
+                fetchBulkValues(count);
+                bulkValueComparator.setBatch(valueBuffer, docBuffer, count);
+                for (int i = 0; i < count; i++) {
+                  countHit();
+                  if (queueFull) {
+                    if (bulkThresholdCheck(i)) {
+                      continue;
+                    }
+                  }
+                  // compareTop check for searchAfter pagination
+                  int topCmp;
+                  if (isMultiSort) {
+                    topCmp = firstReverseMul * bulkValueComparator.compareTopAt(i);
+                    if (topCmp == 0) {
+                      for (int j = 1; j < allComparators.length; j++) {
+                        topCmp = allReverseMul[j] * allComparators[j].compareTop(docBuffer[i]);
+                        if (topCmp != 0) break;
+                      }
+                    }
+                  } else {
+                    topCmp = reverseMul * bulkValueComparator.compareTopAt(i);
+                  }
+                  if (topCmp > 0 || (topCmp == 0 && docBuffer[i] <= afterDoc)) {
+                    // Already collected on a previous page
+                    if (totalHitsRelation == TotalHits.Relation.EQUAL_TO) {
+                      updateMinCompetitiveScore(scorer);
+                    }
+                    continue;
+                  }
+                  if (queueFull) {
+                    bulkCollectCompetitiveHit(i);
+                  } else {
+                    collectedHits++;
+                    bulkCollectAnyHit(i, collectedHits);
+                  }
+                }
+              }
+            }
+
+            @Override
+            public void collectRange(int min, int max) throws IOException {
+              if (bulkValueComparator == null || bulkDocValues == null
+                  ) {
+                super.collectRange(min, max);
+                return;
+              }
+              int batchSize = PrefetchConfig.getBatchSize();
+              if (valueBuffer == null) {
+                docBuffer = new int[batchSize];
+                valueBuffer = new long[batchSize];
+              }
+
+              int pos = min;
+              int firstSize = Math.min(batchSize, max - pos);
+              bulkDocValues.prefetchRange(pos, firstSize);
+
+              while (pos < max) {
+                int batchEnd = Math.min(pos + batchSize, max);
+                int size = batchEnd - pos;
+
+                int nextPos = batchEnd;
+                if (nextPos < max) {
+                  int nextSize = Math.min(batchSize, max - nextPos);
+                  bulkDocValues.prefetchRange(nextPos, nextSize);
+                }
+
+                bulkDocValues.longValuesRange(pos, size, valueBuffer, bulkMissingValue);
+                for (int i = 0; i < size; i++) {
+                  docBuffer[i] = pos + i;
+                }
+                bulkValueComparator.setBatch(valueBuffer, docBuffer, size);
+                for (int i = 0; i < size; i++) {
+                  countHit();
+                  if (queueFull) {
+                    if (bulkThresholdCheck(i)) {
+                      continue;
+                    }
+                  }
+                  int topCmp;
+                  if (isMultiSort) {
+                    topCmp = firstReverseMul * bulkValueComparator.compareTopAt(i);
+                    if (topCmp == 0) {
+                      for (int j = 1; j < allComparators.length; j++) {
+                        topCmp = allReverseMul[j] * allComparators[j].compareTop(docBuffer[i]);
+                        if (topCmp != 0) break;
+                      }
+                    }
+                  } else {
+                    topCmp = reverseMul * bulkValueComparator.compareTopAt(i);
+                  }
+                  if (topCmp > 0 || (topCmp == 0 && docBuffer[i] <= afterDoc)) {
+                    if (totalHitsRelation == TotalHits.Relation.EQUAL_TO) {
+                      updateMinCompetitiveScore(scorer);
+                    }
+                    continue;
+                  }
+                  if (queueFull) {
+                    bulkCollectCompetitiveHit(i);
+                  } else {
+                    collectedHits++;
+                    bulkCollectAnyHit(i, collectedHits);
+                  }
+                }
+
+                pos = batchEnd;
               }
             }
           };
@@ -335,7 +696,7 @@ public abstract class TopFieldCollector extends TopDocsCollector<Entry> {
     this.totalHitsThreshold = Math.max(totalHitsThreshold, numHits);
     this.numComparators = pq.getComparators().length;
     this.firstComparator = pq.getComparators()[0];
-    int reverseMul = pq.reverseMul[0];
+    int reverseMul = pq.getReverseMul()[0];
 
     if (firstComparator.getClass().equals(FieldComparator.RelevanceComparator.class)
         && reverseMul == 1 // if the natural sort is preserved (sort by descending relevance)

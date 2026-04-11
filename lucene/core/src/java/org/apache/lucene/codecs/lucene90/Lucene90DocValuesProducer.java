@@ -543,6 +543,11 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           public long longValue() throws IOException {
             return entry.minValue;
           }
+
+          @Override
+          public void longValuesRange(int minDoc, int size, long[] vals, long defaultValue) {
+            java.util.Arrays.fill(vals, 0, size, entry.minValue);
+          }
         };
       } else {
         final RandomAccessInput slice =
@@ -586,6 +591,20 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
               prefetchFixedBPV(size, docs, slice, entry.bitsPerValue);
             }
           }
+
+          @Override
+          public void prefetchRange(int minDoc, int size) throws IOException {
+            if (PrefetchConfig.isEnabled() && size > 0 && entry.bitsPerValue > 0) {
+              prefetchFixedBPVRange(minDoc, size, slice, entry.bitsPerValue);
+            }
+          }
+
+          @Override
+          public void longValuesRange(int minDoc, int size, long[] vals, long defaultValue) throws IOException {
+            for (int i = 0; i < size; i++) {
+              vals[i] = table[(int) values.get(minDoc + i)];
+            }
+          }
             };
           } else if (entry.gcd == 1 && entry.minValue == 0) {
             // Common case for ordinals, which are encoded as numerics
@@ -599,6 +618,20 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           public void prefetchLongValues(int size, int[] docs) throws IOException {
             if (PrefetchConfig.isEnabled() && size > 0 && entry.bitsPerValue > 0) {
               prefetchFixedBPV(size, docs, slice, entry.bitsPerValue);
+            }
+          }
+
+          @Override
+          public void prefetchRange(int minDoc, int size) throws IOException {
+            if (PrefetchConfig.isEnabled() && size > 0 && entry.bitsPerValue > 0) {
+              prefetchFixedBPVRange(minDoc, size, slice, entry.bitsPerValue);
+            }
+          }
+
+          @Override
+          public void longValuesRange(int minDoc, int size, long[] vals, long defaultValue) throws IOException {
+            for (int i = 0; i < size; i++) {
+              vals[i] = values.get(minDoc + i);
             }
           }
             };
@@ -615,6 +648,20 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           public void prefetchLongValues(int size, int[] docs) throws IOException {
             if (PrefetchConfig.isEnabled() && size > 0 && entry.bitsPerValue > 0) {
               prefetchFixedBPV(size, docs, slice, entry.bitsPerValue);
+            }
+          }
+
+          @Override
+          public void prefetchRange(int minDoc, int size) throws IOException {
+            if (PrefetchConfig.isEnabled() && size > 0 && entry.bitsPerValue > 0) {
+              prefetchFixedBPVRange(minDoc, size, slice, entry.bitsPerValue);
+            }
+          }
+
+          @Override
+          public void longValuesRange(int minDoc, int size, long[] vals, long defaultValue) throws IOException {
+            for (int i = 0; i < size; i++) {
+              vals[i] = mul * values.get(minDoc + i) + delta;
             }
           }
             };
@@ -2354,6 +2401,21 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
         slice.prefetch(firstByte, lastByte - firstByte);
       }
     }
+  }
+
+  /**
+   * Prefetch a contiguous range of fixed-BPV values. Since the range is contiguous,
+   * we always issue a single prefetch for the entire byte range — no per-doc or
+   * density-ratio logic needed.
+   */
+  static void prefetchFixedBPVRange(int minDoc, int size, RandomAccessInput slice, int bitsPerValue)
+      throws IOException {
+    assert size > 0;
+    assert bitsPerValue > 0;
+    int readSize = bitsPerValue <= 8 ? 1 : bitsPerValue <= 16 ? 2 : bitsPerValue <= 32 ? 4 : 8;
+    long firstByte = ((long) minDoc * bitsPerValue) / 8;
+    long lastByte = ((long) (minDoc + size - 1) * bitsPerValue) / 8 + readSize;
+    slice.prefetch(firstByte, lastByte - firstByte);
   }
 
 }

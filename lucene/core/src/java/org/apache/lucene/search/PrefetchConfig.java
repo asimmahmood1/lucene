@@ -21,12 +21,14 @@ package org.apache.lucene.search;
  * methods (longValues, ordValues, prefetchOrdinals, collect(DocIdStream) bulk paths)
  * fall back to their default per-doc implementations without issuing prefetch calls.
  *
- * <p>This is intended to be set by the hosting application (e.g., OpenSearch) to
- * dynamically enable/disable prefetch at runtime for benchmarking and A/B testing.
+ * <p>Toggle at runtime without restart: {@code touch /tmp/prefetch-off} to disable,
+ * {@code rm /tmp/prefetch-off} to re-enable. Checked on every query.
  *
  * @lucene.experimental
  */
 public final class PrefetchConfig {
+
+  private static final java.io.File KILL_SWITCH = new java.io.File("/tmp/prefetch-off");
 
   /** Whether bulk prefetch is enabled. Reads from system property at startup, default true. */
   private static volatile boolean enabled = !"false".equalsIgnoreCase(
@@ -47,9 +49,9 @@ public final class PrefetchConfig {
   private static volatile boolean debugEnabled = "true".equalsIgnoreCase(
       System.getProperty("lucene.prefetch.debug", "false"));
 
-  /** Returns true if bulk prefetch is enabled. */
+  /** Returns true if bulk prefetch is enabled. Checks file-based kill switch for dynamic toggle. */
   public static boolean isEnabled() {
-    return enabled;
+    return enabled && !KILL_SWITCH.exists();
   }
 
   /** Returns true if prefetch debug logging is enabled. */

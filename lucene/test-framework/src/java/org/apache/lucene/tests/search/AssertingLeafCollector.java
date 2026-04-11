@@ -187,5 +187,27 @@ class AssertingLeafCollector extends FilterLeafCollector {
       }
       return mayHaveRemaining;
     }
+
+    @Override
+    public int intoArray(int upTo, int[] array) {
+      assert lastUpTo < upTo
+              || (upTo == DocIdSetIterator.NO_MORE_DOCS
+                  && lastUpTo == DocIdSetIterator.NO_MORE_DOCS)
+          : "upTo=" + upTo + " but previous upTo=" + lastUpTo;
+      int count = stream.intoArray(upTo, array);
+      for (int i = 0; i < count; i++) {
+        assert array[i] > lastCollected : "Out of order : " + lastCollected + " " + array[i];
+        assert array[i] >= min : "Out of range: " + array[i] + " < " + min;
+        assert array[i] < max : "Out of range: " + array[i] + " >= " + max;
+        lastCollected = array[i];
+      }
+      lastUpTo = upTo;
+      if (upTo == DocIdSetIterator.NO_MORE_DOCS) {
+        if (count == 0) {
+          assert stream.mayHaveRemaining() == false;
+        }
+      }
+      return count;
+    }
   }
 }

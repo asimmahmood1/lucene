@@ -172,6 +172,11 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
       return competitiveDISIBuilder == null ? null : competitiveDISIBuilder.competitiveIterator;
     }
 
+    /** Returns the underlying NumericDocValues for bulk reads. */
+    public NumericDocValues getDocValues() {
+      return docValues;
+    }
+
     protected abstract long bottomAsComparableLong();
 
     protected abstract long topAsComparableLong();

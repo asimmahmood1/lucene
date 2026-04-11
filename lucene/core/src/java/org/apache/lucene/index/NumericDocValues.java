@@ -127,4 +127,44 @@ public abstract class NumericDocValues extends DocValuesIterator {
   public void prefetchLongValues(int size, int[] docs) throws IOException {
     // default no-op — codec implementations override with async prefetch
   }
+
+  /**
+   * Bulk read values for a contiguous range of doc IDs {@code [minDoc, minDoc+size)}.
+   * Optimized for the {@code collectRange} path where doc IDs are sequential,
+   * avoiding the need to materialize an {@code int[]} of doc IDs.
+   *
+   * <p>The default implementation delegates to {@link #longValues(int, int[], long[], long)}
+   * by filling a temporary array. Codec implementations should override this to compute
+   * byte ranges directly from {@code (minDoc, size)} without array materialization.
+   *
+   * @param minDoc the first doc ID in the range (inclusive)
+   * @param size the number of consecutive docs to read
+   * @param values the buffer to fill with values (must have length >= size)
+   * @param defaultValue the value for docs without a value
+   */
+  public void longValuesRange(int minDoc, int size, long[] values, long defaultValue)
+      throws IOException {
+    for (int i = 0; i < size; i++) {
+      if (advanceExact(minDoc + i)) {
+        values[i] = longValue();
+      } else {
+        values[i] = defaultValue;
+      }
+    }
+  }
+
+  /**
+   * Async prefetch hint for a contiguous range of doc IDs {@code [minDoc, minDoc+size)}.
+   * Optimized for the {@code collectRange} path where doc IDs are sequential.
+   *
+   * <p>The default implementation is a no-op. Codec implementations should override this
+   * to issue {@code RandomAccessInput.prefetch()} for the byte range covering the values
+   * of docs in {@code [minDoc, minDoc+size)}.
+   *
+   * @param minDoc the first doc ID in the range (inclusive)
+   * @param size the number of consecutive docs to prefetch
+   */
+  public void prefetchRange(int minDoc, int size) throws IOException {
+    // default no-op — codec implementations override with async prefetch
+  }
 }

@@ -103,4 +103,24 @@ final class MultiLeafFieldComparator implements LeafFieldComparator {
     // this is needed for skipping functionality that is only relevant for the 1st comparator
     return firstComparator.competitiveIterator();
   }
+
+  /** Returns the first (primary) comparator. */
+  LeafFieldComparator getFirstComparator() {
+    return firstComparator;
+  }
+
+  /** Returns the first comparator's reverse multiplier. */
+  int getFirstReverseMul() {
+    return firstReverseMul;
+  }
+
+  /** Returns all comparators. */
+  LeafFieldComparator[] getComparators() {
+    return comparators;
+  }
+
+  /** Returns all reverse multipliers. */
+  int[] getReverseMul() {
+    return reverseMul;
+  }
 }
