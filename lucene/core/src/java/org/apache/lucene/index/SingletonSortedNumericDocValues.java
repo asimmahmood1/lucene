@@ -87,4 +87,14 @@ final class SingletonSortedNumericDocValues extends SortedNumericDocValues {
   public int docValueCount() {
     return 1;
   }
+
+  @Override
+  public void prefetchRange(int[] docs, int size) throws IOException {
+    in.prefetchLongValues(size, docs);
+  }
+
+  @Override
+  public void prefetchRange(int startDoc, int count) throws IOException {
+    in.prefetchRange(startDoc, count);
+  }
 }

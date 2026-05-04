@@ -88,4 +88,17 @@ public abstract class SortedNumericDocValues extends DocValuesIterator {
   public void prefetchRange(int[] docs, int size) throws IOException {
     // default no-op — codec implementations override with prefetch
   }
+
+  /**
+   * Prefetch the data for a contiguous range of documents starting at {@code startDoc}.
+   * This is more efficient than {@link #prefetchRange(int[], int)} for dense sequential
+   * doc IDs because it avoids materializing an {@code int[]} array — the implementation
+   * can compute the byte range directly from {@code startDoc} and {@code count}.
+   *
+   * @param startDoc first doc ID in the range
+   * @param count number of documents in the range
+   */
+  public void prefetchRange(int startDoc, int count) throws IOException {
+    // default no-op — codec implementations override with prefetch
+  }
 }
